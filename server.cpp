@@ -8,15 +8,16 @@
 #include <thread>
 #include <atomic>
 #include <memory>
+#include <random>
+#include <vector>
 
 using json = nlohmann::json;
 
 class OnlineManager {
 private:
-    std::mutex mtx_;
+    // 将 mutex 声明为 mutable，这样可以在 const 成员函数中锁定
+    mutable std::mutex mtx_;
     std::unordered_set<std::string> online_users_;  // 在线用户ID集合
-    std::unordered_set<std::string> online_sessions_; // 在线会话ID
-    std::atomic<int> total_online_{0};  // 总在线人数
     
     // 清理过期连接
     struct SessionInfo {
@@ -26,15 +27,31 @@ private:
     };
     std::unordered_map<std::string, SessionInfo> sessions_;
     
+    std::atomic<int> total_online_{0};  // 总在线人数
+    bool running_{true};
+    std::thread cleanup_thread_;
+    
+    // 随机数生成器
+    std::random_device rd_;
+    std::mt19937 gen_;
+    std::uniform_int_distribution<> dis_;
+    
 public:
-    OnlineManager() {
+    OnlineManager() : gen_(rd_()), dis_(1000, 9999) {
         // 启动清理线程
-        std::thread([this]() {
-            while (true) {
+        cleanup_thread_ = std::thread([this]() {
+            while (running_) {
                 cleanupExpiredSessions();
                 std::this_thread::sleep_for(std::chrono::seconds(30));
             }
-        }).detach();
+        });
+    }
+    
+    ~OnlineManager() {
+        running_ = false;
+        if (cleanup_thread_.joinable()) {
+            cleanup_thread_.join();
+        }
     }
     
     // 用户上线
@@ -51,7 +68,7 @@ public:
             std::chrono::steady_clock::now()
         };
         
-        total_online_ = online_users_.size();
+        total_online_ = static_cast<int>(online_users_.size());
         
         return session_id;
     }
@@ -76,13 +93,13 @@ public:
         if (it != sessions_.end()) {
             online_users_.erase(it->second.user_id);
             sessions_.erase(it);
-            total_online_ = online_users_.size();
+            total_online_ = static_cast<int>(online_users_.size());
         }
     }
     
     // 获取在线人数
     int getOnlineCount() const {
-        return total_online_;
+        return total_online_.load();
     }
     
     // 获取在线用户列表
@@ -91,15 +108,21 @@ public:
         return std::vector<std::string>(online_users_.begin(), online_users_.end());
     }
     
+    // 检查会话是否有效
+    bool isValidSession(const std::string& session_id) const {
+        std::lock_guard<std::mutex> lock(mtx_);
+        return sessions_.find(session_id) != sessions_.end();
+    }
+    
 private:
     std::string generateSessionId() {
         auto now = std::chrono::system_clock::now();
         auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
             now.time_since_epoch()).count();
         
-        // 简单生成随机会话ID
-        return "sess_" + std::to_string(timestamp) + "_" + 
-               std::to_string(rand() % 10000);
+        // 使用随机数生成器
+        int random_num = dis_(gen_);
+        return "sess_" + std::to_string(timestamp) + "_" + std::to_string(random_num);
     }
     
     void cleanupExpiredSessions() {
@@ -119,7 +142,7 @@ private:
             }
         }
         
-        total_online_ = online_users_.size();
+        total_online_ = static_cast<int>(online_users_.size());
     }
 };
 
@@ -142,7 +165,8 @@ int main() {
             {"message", "success"},
             {"data", {
                 {"online_count", online_manager.getOnlineCount()},
-                {"timestamp", std::chrono::system_clock::now().time_since_epoch().count()}
+                {"timestamp", std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count()}
             }}
         };
         
@@ -153,7 +177,13 @@ int main() {
     server.Post("/api/online/login", [&](const httplib::Request& req, httplib::Response& res) {
         try {
             auto body = json::parse(req.body);
-            std::string user_id = body["user_id"];
+            std::string user_id = body.value("user_id", "");
+            
+            if (user_id.empty()) {
+                json response = {{"code", -1}, {"message", "user_id is required"}};
+                res.set_content(response.dump(), "application/json");
+                return;
+            }
             
             std::string session_id = online_manager.userLogin(user_id);
             
@@ -170,7 +200,7 @@ int main() {
         } catch (const std::exception& e) {
             json response = {
                 {"code", -1},
-                {"message", e.what()}
+                {"message", std::string("parse error: ") + e.what()}
             };
             res.set_content(response.dump(), "application/json");
         }
@@ -180,7 +210,13 @@ int main() {
     server.Post("/api/online/heartbeat", [&](const httplib::Request& req, httplib::Response& res) {
         try {
             auto body = json::parse(req.body);
-            std::string session_id = body["session_id"];
+            std::string session_id = body.value("session_id", "");
+            
+            if (session_id.empty()) {
+                json response = {{"code", -1}, {"message", "session_id is required"}};
+                res.set_content(response.dump(), "application/json");
+                return;
+            }
             
             bool success = online_manager.userHeartbeat(session_id);
             
@@ -203,7 +239,13 @@ int main() {
     server.Post("/api/online/logout", [&](const httplib::Request& req, httplib::Response& res) {
         try {
             auto body = json::parse(req.body);
-            std::string session_id = body["session_id"];
+            std::string session_id = body.value("session_id", "");
+            
+            if (session_id.empty()) {
+                json response = {{"code", -1}, {"message", "session_id is required"}};
+                res.set_content(response.dump(), "application/json");
+                return;
+            }
             
             online_manager.userLogout(session_id);
             
@@ -235,13 +277,111 @@ int main() {
         res.set_content(response.dump(), "application/json");
     });
     
-    // 6. 健康检查
+    // 6. 检查会话有效性
+    server.Post("/api/online/validate", [&](const httplib::Request& req, httplib::Response& res) {
+        try {
+            auto body = json::parse(req.body);
+            std::string session_id = body.value("session_id", "");
+            
+            if (session_id.empty()) {
+                json response = {{"code", -1}, {"message", "session_id is required"}};
+                res.set_content(response.dump(), "application/json");
+                return;
+            }
+            
+            bool valid = online_manager.isValidSession(session_id);
+            
+            json response = {
+                {"code", 0},
+                {"message", "success"},
+                {"data", {
+                    {"valid", valid}
+                }}
+            };
+            
+            res.set_content(response.dump(), "application/json");
+        } catch (...) {
+            json response = {{"code", -1}, {"message", "invalid request"}};
+            res.set_content(response.dump(), "application/json");
+        }
+    });
+    
+    // 7. 健康检查
     server.Get("/api/health", [](const httplib::Request& req, httplib::Response& res) {
         json response = {
             {"status", "healthy"},
-            {"timestamp", std::chrono::system_clock::now().time_since_epoch().count()}
+            {"timestamp", std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count()}
         };
         res.set_content(response.dump(), "application/json");
+    });
+    
+    // 8. 首页
+    server.Get("/", [](const httplib::Request& req, httplib::Response& res) {
+        std::string html = R"(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>在线人数统计服务器</title>
+    <meta charset="utf-8">
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; }
+        .endpoint { background: #f5f5f5; padding: 10px; margin: 10px 0; border-radius: 5px; }
+        .method { font-weight: bold; color: #0076ff; }
+        .path { font-family: monospace; }
+    </style>
+</head>
+<body>
+    <h1>在线人数统计服务器</h1>
+    <p>服务器已启动！以下是可用的API端点：</p>
+    
+    <div class="endpoint">
+        <span class="method">GET</span> <span class="path">/api/online/count</span> - 获取在线人数
+    </div>
+    <div class="endpoint">
+        <span class="method">POST</span> <span class="path">/api/online/login</span> - 用户登录
+    </div>
+    <div class="endpoint">
+        <span class="method">POST</span> <span class="path">/api/online/heartbeat</span> - 心跳
+    </div>
+    <div class="endpoint">
+        <span class="method">POST</span> <span class="path">/api/online/logout</span> - 用户退出
+    </div>
+    <div class="endpoint">
+        <span class="method">GET</span> <span class="path">/api/online/users</span> - 获取在线用户列表
+    </div>
+    <div class="endpoint">
+        <span class="method">GET</span> <span class="path">/api/health</span> - 健康检查
+    </div>
+    
+    <p>当前时间: <span id="time"></span></p>
+    <p>当前在线人数: <span id="count">0</span></p>
+    
+    <script>
+        function updateTime() {
+            document.getElementById('time').textContent = new Date().toLocaleString();
+        }
+        
+        function fetchOnlineCount() {
+            fetch('/api/online/count')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.code === 0) {
+                        document.getElementById('count').textContent = data.data.online_count;
+                    }
+                })
+                .catch(console.error);
+        }
+        
+        updateTime();
+        fetchOnlineCount();
+        setInterval(updateTime, 1000);
+        setInterval(fetchOnlineCount, 5000);
+    </script>
+</body>
+</html>
+        )";
+        res.set_content(html, "text/html");
     });
     
     std::cout << "Starting server on port 8080...\n";
@@ -251,6 +391,9 @@ int main() {
     std::cout << "  POST /api/online/login     - 用户登录\n";
     std::cout << "  POST /api/online/heartbeat - 心跳\n";
     std::cout << "  POST /api/online/logout    - 用户退出\n";
+    std::cout << "  POST /api/online/validate  - 检查会话有效性\n";
+    std::cout << "  GET  /api/health           - 健康检查\n";
+    std::cout << "  GET  /                      - 首页\n";
     
     server.listen("0.0.0.0", 8080);
     
